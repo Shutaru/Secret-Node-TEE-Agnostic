@@ -267,7 +267,3 @@ The architecture introduces:
 This design is intentionally modular, so that additional TEEs (e.g., AMD SEV-SNP, Intel TDX) can be integrated by implementing new backends and extending the attestation registry policy.
 
 ---
-
-```
-::contentReference[oaicite:0]{index=0}
-```
