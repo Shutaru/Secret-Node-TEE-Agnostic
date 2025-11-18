@@ -315,7 +315,3 @@ This architecture:
 The goal is to create a **research-friendly, modular** foundation to explore multi-TEE node designs without compromising the stability or assumptions of the existing SGX-based network.
 
 ---
-
-```
-::contentReference[oaicite:0]{index=0}
-```
