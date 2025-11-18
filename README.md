@@ -1,3 +1,4 @@
+---
 # Secret Network – TEE-Agnostic Node Architecture (SGX, AMD SEV, AWS Nitro)
 
 > **Status:** Experimental R&D (non-production)
