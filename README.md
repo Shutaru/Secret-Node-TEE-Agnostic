@@ -1,399 +1,388 @@
-# Secret Network – TEE-Agnostic Node Architecture (SGX, AMD SEV, AWS Nitro)
+# Secret Network – Multi-TEE & Confidential AI R&D
+## (SGX / SEV / Nitro + NVIDIA Spark GPU TEEs)
 
-> **Status:** Experimental R&D (non-production)
-> **Scope:** Secret Network node fork / extension exploring a TEE-agnostic design with support for multiple CPU/VM TEEs (Intel SGX, AMD SEV, AWS Nitro)
-> **Audience:** Protocol engineers, systems researchers, confidential computing / TEE experts
+> **Status:** Experimental R&D (non-production)  
+> **Scope:**  
+> - TEE-agnostic Secret node design (SGX, AMD SEV, AWS Nitro)  
+> - Confidential AI / Oracle layer built on NVIDIA Spark (GPU TEE) for Secret  
+> **Audience:** Protocol engineers, systems researchers, confidential computing / AI experts
 
 ---
 
 ## 1. Overview
 
-This repository explores a TEE-agnostic architecture for Secret Network nodes with the long-term goal of supporting multiple trusted execution backends beyond Intel SGX, while remaining within the realm of CPU/VM-style TEEs, such as:
+This repository explores a **two-track R&D effort** around Secret Network:
 
-* Intel SGX (current production TEE for Secret Network)
-* AMD SEV / SEV-SNP (confidential VMs on EPYC)
-* AWS Nitro Enclaves (isolated compute environments in AWS EC2)
+1. **TEE-Agnostic Node Plane (CPU TEEs)**  
+   - Make the Secret node execution layer *logically* independent from a single TEE vendor.  
+   - Keep Intel SGX as the production baseline, but design an abstraction that can, in principle, support:
+     - Intel SGX (current Secret production TEE)  
+     - AMD SEV / SEV-SNP (confidential VMs on EPYC)  
+     - AWS Nitro Enclaves (isolated compute in AWS EC2)
 
-The core idea is to decouple the Secret execution model from a single TEE vendor/implementation, without immediately changing the production network. This is strictly R&D, intended to:
+2. **Confidential AI Plane on NVIDIA Spark (GPU TEEs)**  
+   - Use **NVIDIA Spark-class hardware (Grace + Blackwell GPUs with confidential computing)** as a high-performance **confidential AI / Oracle layer** for Secret:
+     - Private AI oracles (risk, pricing, MEV detection, mempool analysis, etc.)  
+     - Confidential analytics engines for Secret-based DeFi and apps  
+     - An optional, privacy-preserving “Secret Copilot” for operators and developers
 
-1. Design a clean abstraction layer (`TEEBackend`) between the Cosmos/CometBFT node and the confidential execution environment.
-2. Prototype alternative CPU/VM TEE backends (e.g., SEV, Nitro) that could execute CosmWasm within confidential VMs/enclaves.
-3. Study the security, complexity and attack surface implications of a multi-TEE model for Secret Network.
+The key design decision is:
 
-GPU TEEs (e.g., NVIDIA Blackwell confidential computing) are explicitly out of scope for node execution in this project. They may be explored separately as off-chain confidential AI/oracle components, not as consensus nodes.
-
----
-
-## 2. Motivation
-
-### 2.1 Current Secret Network Model (SGX-Centric)
-
-Secret Network currently relies on:
-
-* Cosmos SDK + CometBFT for consensus and networking
-* A CosmWasm-based execution environment running inside Intel SGX enclaves on validator nodes
-* Enclave attestation and TCB validation (e.g., via `quartz-tcbinfo` and Intel DCAP) to ensure:
-
-  * all validators execute a verified enclave binary
-  * contract state remains confidential and integrity-protected
-
-This architecture provides strong privacy and integrity guarantees, but couples Secret tightly to:
-
-* x86-64 CPUs with SGX support
-* Intel’s attestation ecosystem
-* A specific enclave runtime and build pipeline
-
-### 2.2 Why Consider Additional CPU TEEs?
-
-There are other production-grade, CPU/VM-centric TEEs:
-
-* AMD SEV / SEV-SNP on EPYC (confidential VMs with per-VM memory encryption and attestation)
-* AWS Nitro Enclaves (isolated, attested environments inside AWS EC2 instances)
-
-These environments share similar properties with SGX from the perspective of a blockchain node:
-
-* Enforce confidentiality and integrity for code and data in a VM/enclave
-* Provide remote attestation primitives
-* Run standard CPU code (e.g., Rust, Go, CosmWasm VM) with minimal porting compared to GPU execution
-
-This raises research questions:
-
-* Can Secret support multiple CPU TEEs (SGX + SEV + Nitro) safely?
-* What is the right abstraction boundary between node logic and TEE specifics?
-* How does a multi-TEE design affect attack surface, trust assumptions, and node diversity?
-
-### 2.3 Security Caveat: More TEEs = Larger Attack Surface
-
-Adding more enclave types does not automatically increase security. It can:
-
-* Increase the attack surface, since each TEE vendor has its own:
-
-  * bugs
-  * microarchitectural risks
-  * attestation complexity
-
-For this reason, the goal of this project is not to claim that “more TEEs are strictly better”, but to:
-
-* Build a clear, auditable interface for multi-TEE execution.
-* Understand, at a research level, what it would mean to support SEV or Nitro alongside SGX.
-* Make it easier to evaluate trade-offs if the ecosystem ever wants to move in that direction.
+- **CPU TEEs (SGX, SEV, Nitro)** are reserved for the **consensus-critical node path**.  
+- **GPU TEEs (NVIDIA Spark / Blackwell)** are used for **off-chain confidential AI**, feeding results into Secret via oracles/contracts, not running the node itself.
 
 ---
 
-## 3. Problem Statement
+## 2. Goals & Non-Goals
 
-We aim to answer, at a technical design level:
+### 2.1 Goals
 
-**Can we design and implement a TEE abstraction layer for Secret Network such that:**
+- Design a **TEE abstraction layer** (`TEEBackend`) for Secret nodes that:
+  - Preserves current SGX behaviour.
+  - Allows experimentation with SEV / Nitro in devnets/testnets.
 
-* Existing SGX-based validators continue to function unchanged.
-* Experimental node types can use alternative CPU TEEs (e.g., AMD SEV, AWS Nitro) as confidential execution backends.
-* Determinism and consensus safety are preserved.
-* Attestation from different TEEs can be represented and validated in a uniform way.
+- Define and prototype a **Confidential AI Oracle stack** on NVIDIA Spark that:
+  - Runs heavy AI/ML workloads inside GPU TEEs when possible.
+  - Exposes a clean, deterministic interface to Secret contracts.
+  - Can provide privacy-preserving signals: prices, risks, MEV alerts, liquidity decisions, etc.
 
-We break this into sub-problems:
+- Explore a **Confidential Copilot** concept:
+  - Off-chain assistant for validators / developers.
+  - Can analyse logs, metrics, chain data in a privacy-preserving way.
+  - Optional and strictly non-consensus-critical.
 
-1. TEE abstraction
+### 2.2 Non-Goals
 
-   * Define a vendor-agnostic `TEEBackend` interface for executing CosmWasm contracts inside a confidential environment.
-
-2. Alternate CPU TEE backends
-
-   * Prototype backends that delegate execution to:
-
-     * Local SGX (current model)
-     * Remote SEV/SNP VMs
-     * Remote Nitro Enclaves
-
-3. Attestation model
-
-   * Design a common `AttestationReport` structure that can encode:
-
-     * SGX measurements
-     * SEV-SNP attestation
-     * Nitro attestation docs
-
-4. Compatibility & safety
-
-   * Explore how these backends can coexist in devnet/testnet scenarios, without impacting mainnet’s security assumptions.
+- This project does **not**:
+  - Propose replacing SGX in mainnet in the short term.  
+  - Run the Secret node itself inside a GPU TEE.  
+  - Claim that “more TEEs automatically increase security”.  
+  - Provide production-ready code for mainnet.
 
 ---
 
-## 4. High-Level Architecture
+## 3. Motivation
 
-### 4.1 Components
+### 3.1 Secret Network & CPU TEEs
 
-We split the system into:
+Secret Network today:
 
-1. **TEE-Agnostic Secret Node**
+- Uses Cosmos SDK + CometBFT for consensus.  
+- Runs CosmWasm-based smart contracts inside Intel SGX enclaves.  
+- Relies on SGX attestation (e.g., DCAP + `quartz-tcbinfo`) to ensure:
+  - The correct enclave binary is running.  
+  - Contract state and keys remain confidential.
 
-   * Cosmos SDK + CometBFT
-   * `x/compute` (or equivalent) module
-   * `TEEBackend` interface with concrete implementations:
+This works well but implies:
 
-     * `SgxBackend` (existing SGX enclave code path)
-     * `RemoteVmBackend` (for SEV/Nitro remote VMs)
+- A **strong dependency on SGX** (hardware + attestation stack).  
+- Limited flexibility in hosting environments and future TEE alternatives.
 
-2. **Remote VM TEE Hosts (SEV / Nitro)**
+A TEE-agnostic design with a **carefully scoped set of CPU TEEs** (SGX, SEV, Nitro) would:
 
-   * Machines or cloud instances configured with:
+- Allow structured experimentation in devnets/testnets.  
+- Provide a cleaner boundary between:
+  - “What the chain expects from a TEE” vs  
+  - “How any specific vendor implements it”.
 
-     * AMD SEV-SNP-enabled hypervisors, or
-     * AWS Nitro Enclaves
-   * Run a CosmWasm VM runtime inside the confidential VM/enclave
-   * Expose a secure RPC interface for executing contracts and returning outputs + attestation
+### 3.2 NVIDIA Spark & GPU TEEs for Confidential AI
 
-3. **On-Chain TEE/TCB Registry (Optional, Future)**
+NVIDIA Spark-class systems (Grace CPU + Blackwell GPUs) with confidential computing provide:
 
-   * Smart contract or native module storing:
+- Hardware-enforced **GPU TEEs** for AI workloads.  
+- The ability to run:
+  - Private models (weights never exposed in plaintext to the host).  
+  - Private data (user / protocol data stays encrypted outside the GPU TEE).  
+  - Attestable inference/training sessions.
 
-     * Whitelisted measurements / code hashes per TEE type
-     * Policy for acceptable TCB versions
-     * Mapping of `TEEKind` → trust policy
+This is extremely relevant for Secret because:
 
-### 4.2 Conceptual Diagram
+- Secret contracts can store and manage **encrypted state and logic**, but:
+  - Heavy AI (LLMs, deep nets, complex analytics) is not practical *inside* SGX.  
+  - Running large models off-chain is natural, but we want **attestable privacy** and **strong guarantees**.
 
-```
-Secret Node (TEE-Agnostic)
- ├─ Cosmos SDK + CometBFT
- ├─ x/compute / CosmWasm integration
- └─ TEEBackend
-     ├─ SgxBackend         (local SGX enclave)
-     └─ RemoteVmBackend    (remote SEV / Nitro VM)
-           └─ RPC → VM Host (SEV/Nitro) → CosmWasm VM in TEE
-```
+By combining:
 
----
+- Secret (private smart contracts, encrypted state) and  
+- Spark (GPU-accelerated confidential AI),
 
-## 5. TEE Backend Abstraction
+we can build:
 
-### 5.1 Interface Sketch
+- **Confidential AI Oracles** that:
+  - Read encrypted or partially protected data.  
+  - Run AI analytics/inference in GPU TEE.  
+  - Return compact, attestable results to Secret.
 
-On the Rust side (conceptual):
-
-```
-pub enum TEEKind {
-    IntelSgx,
-    AmdSevSnp,
-    AwsNitro,
-}
-
-pub struct AttestationReport {
-    pub tee_kind: TEEKind,
-    pub measurement: [u8; 32],
-    pub vendor_sig: Vec<u8>,
-    pub tcb_version: u64,
-    pub timestamp: u64,
-    // Additional vendor-specific data can be included or referenced.
-}
-
-pub trait TEEBackend {
-    fn init(&mut self, cfg: BackendConfig) -> anyhow::Result<()>;
-
-    fn execute_contract(
-        &self,
-        contract_code: &[u8],
-        env: &Env,
-        msg: &[u8],
-    ) -> anyhow::Result<Vec<u8>>;
-
-    fn query_contract(
-        &self,
-        contract_code: &[u8],
-        env: &Env,
-        msg: &[u8],
-    ) -> anyhow::Result<Vec<u8>>;
-
-    fn get_consensus_keys(&self) -> anyhow::Result<ConsensusKeys>;
-
-    fn attest(&self) -> anyhow::Result<AttestationReport>;
-}
-```
-
-Concrete implementations:
-
-* `SgxBackend`
-
-  * Wraps existing SGX enclave code and Intel DCAP attestation path.
-
-* `RemoteVmBackend`
-
-  * Communicates (e.g., via gRPC/mTLS) with a remote TEE host (SEV VM or Nitro Enclave).
-  * Sends contract execution requests and receives:
-
-    * Output bytes / new state root
-    * A TEE-specific attestation blob that is mapped into `AttestationReport`
-
-### 5.2 Determinism and Consensus
-
-For consensus safety:
-
-* Given the same `(code, env, msg)` triple, all honest nodes—regardless of backend—must derive the same output.
-* No backend may allow non-deterministic behaviour to leak into the state machine.
-
-This implies:
-
-* CosmWasm VM semantics must remain deterministic.
-* External sources of randomness/time must be either:
-
-  * Disabled, or
-  * Funneled through deterministic, consensus-level APIs.
+- **Confidential Copilot** patterns that assist:
+  - Validators (alerting, tuning, monitoring)  
+  - dApp devs (design, debugging, risk analysis)
+  without exposing raw logs or sensitive data.
 
 ---
 
-## 6. Remote VM TEE Backends (SEV / Nitro)
+## 4. Architecture at 10,000 ft
 
-### 6.1 General Model
+Very high-level, we have two planes:
 
-A Remote VM TEE host is:
+1. **Node Plane (CPU TEEs)** – consensus critical  
 
-* A physical or virtual machine with:
+    Secret Node (TEE-Agnostic)
+     ├─ Cosmos SDK + CometBFT
+     ├─ x/compute / CosmWasm integration
+     └─ TEEBackend
+         ├─ SgxBackend         (local SGX enclave – current)
+         └─ RemoteVmBackend    (remote SEV / Nitro VM – R&D)
 
-  * AMD EPYC + SEV-SNP, or
-  * AWS EC2 + Nitro Enclave support
-* Running a minimal CosmWasm runtime in a confidential VM/enclave
-* Exposing a secure RPC interface:
+2. **AI Plane (GPU TEEs) – off-chain, non-consensus**  
 
-  * `InitContract`
-  * `ExecuteContract`
-  * `QueryContract`
-  * `GetAttestation`
+    Confidential AI Cluster (NVIDIA Spark / GPU TEE)
+     ├─ AI Oracles (price, risk, MEV, liquidity)
+     ├─ Confidential Analytics Services
+     └─ Optional Copilot services (operator / dev assistant)
 
-Secret nodes using `RemoteVmBackend` send contract execution requests to this host and receive:
-
-* Execution results (output, new state root)
-* TEE attestation data
-
-### 6.2 Attestation Path
-
-For each VM/enclave:
-
-1. The host configures a confidential VM / enclave with:
-
-   * Specific OS image
-   * Pinned CosmWasm runtime binary
-
-2. The vendor TEE stack (SEV-SNP / Nitro) produces an attestation document:
-
-   * Contains measurement of the VM image/code
-   * Is signed by the platform/TEE root of trust
-
-3. The Secret node verifies:
-
-   * That the measurement matches a whitelisted value in local config or an on-chain registry
-   * That the attestation chain is valid for the `TEEKind` in question
-
-The same `AttestationReport` abstraction is used for SGX and non-SGX TEEs, enabling unified logging and policy handling.
+Secret contracts interact with the AI Plane via **oracle contracts** and **off-chain relayers**, but the core node stays CPU-TEE-based.
 
 ---
 
-## 7. Compatibility and Deployment Modes
+## 5. Subsystem A: TEE-Agnostic Node Plane (CPU TEEs)
 
-### 7.1 Coexistence with SGX Nodes
+### 5.1 TEEBackend Interface (Conceptual)
 
-Initial R&D will not touch mainnet:
+In Rust-like pseudocode:
 
-1. Devnet with SGX-only nodes
+    pub enum TEEKind {
+        IntelSgx,
+        AmdSevSnp,
+        AwsNitro,
+    }
+    
+    pub struct AttestationReport {
+        pub tee_kind: TEEKind,
+        pub measurement: [u8; 32],
+        pub vendor_sig: Vec<u8>,
+        pub tcb_version: u64,
+        pub timestamp: u64,
+        // Vendor-specific fields can be added or referenced.
+    }
+    
+    pub trait TEEBackend {
+        fn init(&mut self, cfg: BackendConfig) -> anyhow::Result<()>;
+    
+        fn execute_contract(
+            &self,
+            contract_code: &[u8],
+            env: &Env,
+            msg: &[u8],
+        ) -> anyhow::Result<Vec<u8>>;
+    
+        fn query_contract(
+            &self,
+            contract_code: &[u8],
+            env: &Env,
+            msg: &[u8],
+        ) -> anyhow::Result<Vec<u8>>;
+    
+        fn get_consensus_keys(&self) -> anyhow::Result<ConsensusKeys>;
+    
+        fn attest(&self) -> anyhow::Result<AttestationReport>;
+    }
 
-   * Baseline behaviour and tests.
+Concrete backends:
 
-2. Devnet with mixed backends
+- `SgxBackend`  
+  - Wraps the existing SGX enclave and Intel DCAP attestation path.  
 
-   * Some nodes configured with `SgxBackend`.
-   * Some with `RemoteVmBackend` (SEV/Nitro).
-   * Compare state transitions and outputs under identical workloads.
+- `RemoteVmBackend`  
+  - Talks to a remote VM TEE host (SEV-SNP or Nitro Enclave) over a secure RPC channel.  
+  - Sends contract execution requests and receives:
+    - Deterministic execution results.  
+    - Vendor-specific attestation data mapped into `AttestationReport`.
 
-3. Isolated TEE testnets
+### 5.2 Determinism & Safety
 
-   * Dedicated networks using only SEV/Nitro backends for targeted experiments.
+Consensus-critical constraints:
 
-Only if and when the design proves robust and audited, would any mainnet-facing proposals be discussed at governance level.
+- For a given `(code, env, msg)` triple, **all honest nodes**, regardless of backend, must compute the **same result**.  
+- No backend may leak:
+  - host time,  
+  - non-deterministic randomness,  
+  - external side effects  
+  into the state machine.
 
-### 7.2 Governance and Trust Policy (Long-Term)
+Thus:
 
-A hypothetical long-term path (not a commitment):
-
-1. Introduce `TEEKind` metadata at the protocol level.
-2. Add an on-chain TEE/TCB registry that maps:
-
-   * `(TEEKind, measurement, tcb_version)` → “allowed / disallowed”.
-3. Through governance, optionally whitelist `AmdSevSnp` or `AwsNitro` for certain roles / phases.
-4. Carefully monitor security implications and revert if issues arise.
+- CosmWasm stays deterministic by design.  
+- TEEs are used only to protect code/data, not to change the semantics of execution.
 
 ---
 
-## 8. Threat Model and Limitations
+## 6. Subsystem B: Confidential AI Plane on NVIDIA Spark
 
-### 8.1 Threats
+### 6.1 Hardware & Trust Model
 
-* Compromise or bug in any TEE implementation (SGX, SEV, Nitro) could undermine guarantees if that TEE is trusted for execution.
-* Misconfiguration or incorrect attestation verification.
-* Network attackers intercepting or tampering with RPC between node and remote VM host.
+The Confidential AI layer assumes:
 
-### 8.2 Assumptions
+- A NVIDIA Spark-class system with:
+  - Grace CPU for orchestration and secure VM/container hosting.  
+  - Blackwell GPUs with **GPU-TEE / confidential computing** for AI workloads.
 
-* Each TEE type (SGX, SEV-SNP, Nitro) provides standard confidential computing guarantees:
+We treat the Spark cluster as:
 
-  * Confidentiality and integrity for code/data
-  * Cryptographically sound attestation, under the vendor’s trust model
+- A high-performance **confidential AI “coprocessor”** for Secret.  
+- Separate from consensus; it **does not run `secret-node`**.  
+- A source of **attestable AI results** that can be consumed by Secret contracts.
 
-* CosmWasm execution remains deterministic given fixed inputs.
+### 6.2 Roles of the AI Plane
 
-### 8.3 Explicit Limitations
+1. **Confidential AI Oracles**  
+   - Tasks:
+     - Price feeds, volatility estimates.  
+     - Risk scoring for positions / addresses.  
+     - MEV detection / mempool pattern analysis (for chains where mempool is visible).  
+     - Liquidity optimisation signals (e.g., MAILN-like strategies).
+   - Data:
+     - Public chain data (from Secret + other chains).  
+     - Off-chain market data.  
+     - Possibly encrypted or aggregated private data sent from Secret.
 
-* This project does not claim that multi-TEE is strictly safer than SGX-only.
-* It does not propose GPU TEEs as execution environments for Secret nodes.
-* It is not production-ready, and must not be used to handle real funds or sensitive workloads.
+2. **Confidential Analytics Engines**  
+   - Batch or streaming analytics over:
+     - Secret DeFi protocols.  
+     - Cross-chain flows and risk metrics.  
+   - Results fed back into Secret via governance or dedicated contracts.
+
+3. **Confidential Copilot (Optional)**  
+   - Helps node operators and developers:
+     - Understand logs, performance, anomalies.  
+     - Propose parameter changes or upgrades.  
+   - Can run:
+     - Partially inside GPU TEE (for sensitive data).  
+     - Partially on top of public / non-sensitive context.
+
+### 6.3 AI Oracle API (Conceptual)
+
+The AI Plane exposes a stable, deterministic API, e.g.:
+
+    AIRequest {
+        id:            UUID,
+        model_id:      String,
+        task:          String,        // e.g. "risk_score", "price_forecast"
+        input_payload: Bytes,        // structured data (JSON/CBOR/Protobuf)
+        constraints:   PolicyConfig, // e.g. max_time, determinism constraints
+    }
+    
+    AIResponse {
+        id:              UUID,
+        status:          "ok" | "error",
+        output_payload:  Bytes,      // model output (JSON/CBOR/Protobuf)
+        model_commit:    [u8; 32],   // hash of model weights/config
+        tee_attestation: Bytes,      // GPU TEE attestation blob (optional)
+    }
+
+Relayers and oracle workers translate `AIResponse` into Secret contract calls.
 
 ---
 
-## 9. Roadmap (R&D Phases)
+## 7. Example Flows
 
-### Phase 0 — Code Survey & Design
+### 7.1 CPU TEE Execution (TEE-Agnostic Node)
 
-* Identify all SGX-specific integration points in the current Secret node.
-* Design `TEEBackend` and `AttestationReport` abstractions.
+1. User sends a transaction to execute a Secret contract.  
+2. Node’s `x/compute` module calls into `TEEBackend::execute_contract`.  
+3. Depending on configuration:
+   - `SgxBackend` runs the contract inside the local SGX enclave, OR  
+   - `RemoteVmBackend` sends the request to a SEV/Nitro host and verifies attestation.  
+4. The node applies the resulting state transition and continues consensus.
 
-### Phase 1 — TEEBackend Refactor (SGX Only)
+The rest of the network only sees deterministic state changes; which specific TEE did the work is abstracted away.
 
-* Implement `TEEBackend` with `SgxBackend` wrapping existing behaviour.
-* Ensure that the SGX-only node runs unchanged, but now through the abstraction layer.
+### 7.2 AI Oracle for a Secret Contract (Spark / GPU TEE)
 
-### Phase 2 — Dummy Remote Backend
+1. A Secret contract wants, for example, a **risk score** or **liquidity adjustment signal**.  
+2. It emits an event or updates a dedicated “oracle request” contract.  
+3. An off-chain **Oracle Relayer** observes this event and sends an `AIRequest` to the Spark AI Plane.  
+4. Inside Spark:
+   - A model runs inside the GPU TEE on the relevant data.  
+   - The AI Plane produces an `AIResponse` with:
+     - The risk score / decision.  
+     - Optional GPU-TEE attestation of the inference session / model hash.
+5. The Oracle Relayer submits the `AIResponse` back into Secret, invoking an **Oracle Consumer contract**.  
+6. The contract:
+   - Verifies the response (optionally checks a commitment/attestation scheme).  
+   - Updates its own logic (e.g., adjusts parameters, enforces limits, triggers actions).
 
-* Implement a `RemoteVmBackend` that talks to a simple non-TEE service (pure software).
-* Verify interface correctness, error handling, and determinism.
+Secret stays in control; Spark is a “confidential AI oracle provider”.
 
-### Phase 3 — SEV / Nitro PoC
+---
 
-* Stand up a SEV-SNP or Nitro environment.
-* Deploy a minimal CosmWasm runtime inside a confidential VM/enclave.
-* Wire up `RemoteVmBackend` to execute contracts there.
-* Integrate basic attestation verification.
+## 8. Repository Layout (Proposed)
 
-### Phase 4 — Cross-Backend Consistency Testing
+A possible directory structure for this repo:
 
-* Run the same workloads across SGX and SEV/Nitro backends.
-* Identify non-determinism or discrepancies.
-* Iterate until behaviour is consistent or limitations are understood.
+    /node/
+      /tee/
+        backend_trait.rs
+        sgx_backend.rs
+        remote_vm_backend.rs
+      /docs/
+        tee_design.md
+    
+    /ai-plane/
+      /spark-oracle/
+        api/
+        inference-engine/
+        attestation-integration/
+      /docs/
+        ai_oracle_design.md
+        copilot_concepts.md
+    
+    /integration/
+      secret_oracle_contracts/
+      relayer/
+    
+    README.md
+    ARCHITECTURE.md
+    SECURITY_NOTES.md
 
-### Phase 5 — Optional TEE/TCB Registry & Governance Hooks
+This is indicative; actual code layout may evolve.
 
-* Prototype an on-chain registry for TEE measurements.
-* Define example governance rules for whitelisting TEEs in a testnet context.
+---
+
+## 9. R&D Roadmap (Dual Track)
+
+### 9.1 Node Plane (TEE-Agnostic CPU TEEs)
+
+- Phase N0 – Code survey & TEEBackend design  
+- Phase N1 – SGX-only refactor behind `TEEBackend`  
+- Phase N2 – Dummy `RemoteVmBackend` (non-TEE local service)  
+- Phase N3 – SEV / Nitro PoC with basic attestation  
+- Phase N4 – Cross-backend determinism tests (SGX vs SEV/Nitro)  
+- Phase N5 – Optional TEE/TCB registry and governance hooks for testnets
+
+### 9.2 AI Plane (Confidential AI on Spark)
+
+- Phase A0 – Define AI Oracle API and data models  
+- Phase A1 – Implement baseline AI Oracle (no TEE, deterministic paths)  
+- Phase A2 – Integrate with NVIDIA Spark and GPU-TEE attestation for inference  
+- Phase A3 – Build Secret-side oracle contracts + relayers  
+- Phase A4 – Pilot use cases:
+  - Price oracle  
+  - Risk / credit scoring  
+  - MEV / volume pattern alerts  
+  - Liquidity optimisation
+- Phase A5 – Explore Confidential Copilot patterns (logs, metrics, tuning)
 
 ---
 
 ## 10. Disclaimer
 
-This repository and its design are:
+This repository and design are:
 
-* Experimental and research-focused
-* Not affiliated with any official Secret Network roadmap, unless explicitly adopted by the core team
-* Provided without any warranties of correctness or security
-* Not intended for mainnet use or real economic value
+- **Experimental and research-focused**  
+- **Not** part of any official Secret Network roadmap unless explicitly adopted by the core team  
+- Provided without any warranties of correctness or security  
+- **Not** intended for mainnet use or handling real economic value
 
 Use at your own risk.
 
 ---
-
