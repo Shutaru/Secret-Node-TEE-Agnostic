@@ -1,301 +1,302 @@
-````markdown
 # ARCHITECTURE
+## Secret Multi-TEE Node + Confidential AI on NVIDIA Spark
 
-> **Project:** Secret Network – TEE-Agnostic Node (SGX, AMD SEV, AWS Nitro)  
+> **Project:** Secret Network – Multi-TEE Node (CPU TEEs) + Confidential AI / Oracle (GPU TEEs)  
 > **Status:** Experimental / R&D
 
-This document describes the high-level architecture of a **TEE-agnostic Secret node** that can, in principle, support multiple **CPU/VM TEEs**:
+This document details the architecture for:
 
-- Intel SGX (current production TEE),
-- AMD SEV / SEV-SNP (confidential VMs),
-- AWS Nitro Enclaves (isolated VMs in AWS).
+1. A **TEE-agnostic Secret node** that can, in principle, support multiple CPU TEEs (SGX, AMD SEV, AWS Nitro).  
+2. A **Confidential AI Plane** running on NVIDIA Spark (Grace + Blackwell GPU TEEs), used as a high-performance confidential oracle and analytics layer for Secret.
 
-The goals are:
+The core separation is:
 
-- clean separation between **consensus / state machine** and **TEE-specific execution**;
-- ability to prototype **alternate CPU TEEs** without touching the core logical semantics of the chain;
-- maintain compatibility with existing SGX-only nodes (for devnet/testnet scenarios).
-
-**Note:** GPU TEEs (e.g., NVIDIA Blackwell) are explicitly **out of scope for node execution** here. They may be used in separate **off-chain confidential AI/oracle services**, documented elsewhere.
+- **Node Plane (CPU TEEs)** → consensus-critical, conservative, SGX-first.  
+- **AI Plane (GPU TEEs)** → off-chain, non-consensus, high-compute confidential AI.
 
 ---
 
 ## 1. Component Overview
 
-The system consists of three main layers:
+We conceptually split the system into three domains:
 
-1. **TEE-Agnostic Secret Node**  
-2. **Remote VM TEE Hosts (SEV / Nitro)**  
-3. **On-Chain TEE/TCB Registry (optional, future)**
+1. **Secret Node Plane (CPU TEEs)**  
+2. **Confidential AI Plane (NVIDIA Spark / GPU TEEs)**  
+3. **On-Chain Contracts & Oracles**
 
-### 1.1 Component Diagram
+### 1.1 Node Plane (CPU TEEs)
 
-```mermaid
-graph LR
-  subgraph SecretNode["Secret Node (TEE-Agnostic)"]
-    A[Cosmos SDK<br/>+ CometBFT]
-    B[x/compute Module<br/>+ CosmWasm Integration]
-    C[TEEBackend Interface]
-    C1[SgxBackend]
-    C2[RemoteVmBackend<br/>(SEV / Nitro)]
-  end
+    Secret Node
+     ├─ Cosmos SDK + CometBFT
+     ├─ x/compute Module
+     └─ TEEBackend
+         ├─ SgxBackend         (local SGX enclave)
+         └─ RemoteVmBackend    (remote SEV / Nitro VM)
 
-  subgraph RemoteTEE["Remote VM TEE Hosts"]
-    D[gRPC / RPC Server]
-    E[Confidential VM / Enclave<br/>(SEV-SNP or Nitro)]
-    F[CosmWasm VM<br/>Inside TEE]
-  end
+Key properties:
 
-  subgraph OnChain["On-Chain (Secret)"]
-    G[Contracts / Modules]
-    H[TEE/TCB Registry<br/>(future, optional)]
-  end
+- Runs consensus-critical logic.  
+- Enforces determinism in contract execution.  
+- Uses CPU TEEs for confidentiality (SGX today; SEV/Nitro for R&D).
 
-  A --> B
-  B --> C
-  C --> C1
-  C --> C2
+### 1.2 AI Plane (NVIDIA Spark / GPU TEEs)
 
-  C2 -->|Execute/Query| D
-  D --> E
-  E --> F
-  F --> D
-  D -->|Result + Attestation| C2
+    Confidential AI Cluster (NVIDIA Spark)
+     ├─ Inference Orchestrator (Grace CPU)
+     ├─ GPU TEE Sessions (Blackwell)
+     ├─ Model Registry & Policy
+     └─ AI Services:
+         ├─ Price / Risk Oracles
+         ├─ MEV & Liquidity Analytics
+         └─ Optional Copilot Services
 
-  A --> G
-  G --> H
-````
+Key properties:
 
-**Key ideas:**
+- Off-chain, not part of consensus.  
+- Can run expensive models (LLMs, deep nets, simulations).  
+- Uses GPU TEEs and/or confidential VMs to protect data and model IP.
 
-* The Secret node relies on a **`TEEBackend` interface** rather than hard-coding SGX.
-* `SgxBackend` preserves the current SGX behaviour.
-* `RemoteVmBackend` delegates contract execution to a **confidential VM/enclave** based on AMD SEV-SNP or AWS Nitro.
-* An optional **TEE/TCB Registry** can store whitelisted measurements and attestation policies.
+### 1.3 On-Chain Contracts & Oracles
+
+    Secret Network (On-Chain)
+     ├─ Application Contracts (DeFi, dApps, etc.)
+     ├─ Oracle Request / Response Contracts
+     └─ (Optional) TEE/TCB Registry Contract
+
+- Application contracts can request AI / oracle results indirectly.  
+- Oracle contracts receive off-chain responses and forward results to consumers.  
+- A TEE/TCB registry (optional) can hold whitelisted TEE measurements for CPU TEEs and possibly GPU TEEs used in oracles.
 
 ---
 
-## 2. TEE Backend Abstraction
+## 2. Node Plane Architecture (TEE-Agnostic CPU TEEs)
 
-The `TEEBackend` abstraction decouples:
+### 2.1 TEEBackend Interface and Implementations
 
-* **Node logic** (Cosmos SDK, CometBFT, `x/compute`)
-  from
-* **TEE implementation** (SGX enclave vs remote SEV/Nitro VM).
+The node integrates a TEE abstraction:
 
-### 2.1 Conceptual Interface
+    pub enum TEEKind {
+        IntelSgx,
+        AmdSevSnp,
+        AwsNitro,
+    }
+    
+    pub struct AttestationReport {
+        pub tee_kind: TEEKind,
+        pub measurement: [u8; 32],
+        pub vendor_sig: Vec<u8>,
+        pub tcb_version: u64,
+        pub timestamp: u64,
+    }
+    
+    pub trait TEEBackend {
+        fn init(&mut self, cfg: BackendConfig) -> anyhow::Result<()>;
+        fn execute_contract(&self, code: &[u8], env: &Env, msg: &[u8])
+            -> anyhow::Result<Vec<u8>>;
+        fn query_contract(&self, code: &[u8], env: &Env, msg: &[u8])
+            -> anyhow::Result<Vec<u8>>;
+        fn get_consensus_keys(&self) -> anyhow::Result<ConsensusKeys>;
+        fn attest(&self) -> anyhow::Result<AttestationReport>;
+    }
 
-Conceptually, the backend interface looks like:
+Backends:
 
-```text
-TEEBackend
- ├─ init(config)
- ├─ execute_contract(code, env, msg) -> bytes
- ├─ query_contract(code, env, msg) -> bytes
- ├─ get_consensus_keys() -> ConsensusKeys
- └─ attest() -> AttestationReport
-```
+- `SgxBackend`  
+  - Direct ECALL/OCALL to SGX enclave.  
+  - Uses Intel DCAP or similar for attestation.
 
-Concrete implementations:
+- `RemoteVmBackend`  
+  - Sends requests to a remote VM TEE host (SEV-SNP or Nitro Enclave).  
+  - Receives execution result + VM attestation.  
+  - Verifies that:
+    - The measurement is expected.  
+    - The attestation chain is valid.
 
-* **`SgxBackend`**:
+### 2.2 Execution Flow (Node Plane)
 
-  * uses the existing SGX enclave, ECALL/OCALL bindings and Intel DCAP attestation path;
-* **`RemoteVmBackend`**:
+Steps for contract execution:
 
-  * sends execution requests over a secure RPC channel to a remote TEE host (SEV-SNP VM or Nitro Enclave),
-  * receives execution results and an attestation document.
+1. Node receives a transaction with a contract call.  
+2. `x/compute` prepares the execution context (`code`, `env`, `msg`).  
+3. `x/compute` calls `TEEBackend::execute_contract(...)`.  
+4. Depending on configuration:
+   - `SgxBackend`:
+     - Invokes SGX enclave locally.  
+   - `RemoteVmBackend`:
+     - Sends execution request to a remote VM TEE host.  
+     - Receives result + attestation and validates them.
+5. On success:
+   - The deterministic result is applied to the state machine.  
+   - CometBFT consensus commits the block as usual.
 
----
+Determinism is enforced by:
 
-## 3. Execution Flow (Remote VM Backend)
-
-This section describes the execution flow when a contract is handled via `RemoteVmBackend`.
-
-### 3.1 Sequence Diagram – Contract Execution (Remote VM)
-
-```mermaid
-sequenceDiagram
-    participant User as User / Client
-    participant Node as Secret Node<br/>(TEE-Agnostic)
-    participant Compute as x/compute Module
-    participant Backend as TEEBackend<br/>(RemoteVmBackend)
-    participant Host as Remote VM TEE Host<br/>(SEV / Nitro)
-    participant VM as CosmWasm VM<br/>Inside TEE
-
-    User->>Node: Tx: ExecuteContract(contract, msg)
-    Node->>Compute: DeliverTx
-    Compute->>Backend: execute_contract(code, env, msg)
-    Backend->>Host: gRPC ExecuteContract(code_hash, env, msg, state_root)
-    Host->>VM: Run contract deterministically
-    VM-->>Host: output_data, new_state_root
-    Host-->>Host: Generate TEE attestation (SEV/Nitro)
-    Host-->>Backend: output_data, new_state_root, attestation_report
-    Backend->>Node: output_data, new_state_root
-    Node->>Compute: Apply state changes
-    Node-->>User: Tx result / events
-```
-
-**Notes:**
-
-* All semantics of CosmWasm execution remain the same; only the “where” changes (local SGX vs remote VM TEE).
-* Determinism is enforced at the VM level: given identical inputs, all honest TEEs must return identical outputs.
-
----
-
-## 4. Attestation and Trust Model
-
-The architecture provides a **generic attestation abstraction** to cover SGX, SEV and Nitro.
-
-### 4.1 Generic Attestation Structure
-
-Conceptually, inside the node we can represent attestation as:
-
-```text
-AttestationReport
- ├─ tee_kind        (IntelSgx | AmdSevSnp | AwsNitro)
- ├─ measurement     (hash of VM/enclave code + config)
- ├─ vendor_sig      (signature or proof from vendor root-of-trust)
- ├─ tcb_version
- └─ timestamp
-```
-
-* `tee_kind`
-
-  * identifies which TEE implementation produced the report.
-* `measurement`
-
-  * uniquely identifies the code/config image running inside the TEE.
-* `vendor_sig`
-
-  * allows the node to verify authenticity, using vendor libraries or a local CA bundle.
-* `tcb_version` / `timestamp`
-
-  * useful for enforcing minimum patch levels and freshness.
-
-### 4.2 Attestation Flow (Remote VM)
-
-```mermaid
-sequenceDiagram
-    participant Host as Remote VM TEE Host
-    participant Vendor as TEE Vendor<br/>(AMD / AWS)
-    participant Node as Secret Node
-    participant Registry as On-Chain Registry<br/>(optional)
-
-    Host->>Vendor: Request attestation (VM/enclave context)
-    Vendor-->>Host: attestation_blob (signed)
-    Host-->>Node: ExecuteResponse + attestation_blob
-    Node->>Vendor: (optional) Verify attestation, CRL, cert chain
-    Node->>Registry: (optional) Check measurement & TCB policy
-    Node-->>Node: Accept or reject execution result
-```
-
-Two possible verification modes:
-
-1. **Off-chain verification**
-
-   * Node uses vendor libraries to verify the attestation blob (SEV-SNP report, Nitro document, etc.).
-2. **On-chain registry (future)**
-
-   * Node also checks that `measurement` and `tcb_version` are whitelisted in an on-chain TEE registry.
+- CosmWasm semantics.  
+- Node-level restrictions against non-deterministic system calls.
 
 ---
 
-## 5. Compatibility with Existing SGX Nodes
+## 3. AI Plane Architecture (NVIDIA Spark / GPU TEEs)
 
-The design is deliberately structured to **coexist** with SGX-only nodes.
+### 3.1 Spark Cluster Components
 
-### 5.1 Dual Backend Strategy
+The Confidential AI Plane is composed of:
 
-* **SGX nodes (current behaviour):**
+- **Inference Orchestrator (Grace CPU):**
+  - Schedules requests across GPU TEE sessions.  
+  - Manages model loading, versioning, and policy enforcement.
 
-  * `TEEBackend` is configured to use `SgxBackend`.
-  * Runtime semantics are unchanged; they still use local SGX enclaves.
+- **GPU TEE Sessions (Blackwell GPUs):**
+  - Run AI models (LLMs, transformers, risk models, etc.).  
+  - Keep weights and data confidential inside GPU TEE.  
+  - Produce attestable outputs where supported.
 
-* **Experimental nodes (R&D):**
+- **Model Registry & Policy:**
+  - Maps `model_id` → model weights, version, allowed inputs.  
+  - Enforces which models may answer which types of requests.
 
-  * `TEEBackend` is configured to use `RemoteVmBackend`.
-  * They offload contract execution to remote SEV/Nitro hosts.
+- **AI Services:**
+  - Price / risk oracles.  
+  - MEV detection, liquidity optimisation logic.  
+  - Copilot services (log analysis, advice).
 
-As long as:
+### 3.2 AI Service API
 
-* CosmWasm execution remains deterministic, and
-* the same contract inputs are provided,
+Common API surface:
 
-both SGX and SEV/Nitro backends **should produce the same state transitions**. Mixed testnets can be used to verify this in practice.
+    AIRequest {
+        id:            UUID,
+        model_id:      String,       // e.g. "risk_v1", "mev_detector_v2"
+        task:          String,       // e.g. "score", "forecast", "classify"
+        input_payload: Bytes,        // e.g. JSON/CBOR with market/chain data
+        constraints:   PolicyConfig, // limits: max_time, determinism, etc.
+    }
+    
+    AIResponse {
+        id:              UUID,
+        status:          "ok" | "error",
+        output_payload:  Bytes,      // e.g. JSON with risk score / decision
+        model_commit:    [u8; 32],   // hash of model weights/config
+        tee_attestation: Bytes,      // optional GPU TEE attestation blob
+    }
 
-### 5.2 Deployment Modes
+The AI Plane ensures:
 
-1. **Isolated Devnet (Remote TEE only)**
-
-   * Only `RemoteVmBackend` nodes; used to validate TEE integration and attestation logic.
-
-2. **Mixed Testnet (SGX + Remote)**
-
-   * Some nodes use `SgxBackend`, some use `RemoteVmBackend`.
-   * Useful to detect divergence, non-determinism, or performance/pathological behaviours.
-
-3. **Mainnet (Hypothetical, Long-Term)**
-
-   * Would require:
-
-     * governance decisions,
-     * security audits,
-     * clearly defined trust policies.
-   * Out of scope for this R&D phase.
-
----
-
-## 6. Failure Modes and Fallbacks
-
-The architecture must handle failures without compromising consensus integrity.
-
-### 6.1 Remote Host Failure / Timeout
-
-If the remote TEE host is unavailable or times out:
-
-* `RemoteVmBackend` should:
-
-  * fail the execution gracefully, logging diagnostics, or
-  * (if configured and safe) fall back to a local SGX backend for that node.
-
-### 6.2 Attestation Failure
-
-If attestation verification fails:
-
-* The execution result **must be rejected**.
-* The node should:
-
-  * log the failure,
-  * flag the host / TEE instance as untrusted until fixed.
-
-### 6.3 Non-Determinism / Divergence
-
-If SGX and RemoteVm backends disagree in devnet/testnet on the result of the same input:
-
-* That is treated as a critical bug in the R&D stack:
-
-  * identify the source (VM differences, syscall differences, time/rand usage, etc.);
-  * do not promote the multi-TEE design further until resolved.
+- For a given model and input, the output is as deterministic as model design allows.  
+- Where available, `tee_attestation` proves that the model ran inside an approved GPU TEE session.
 
 ---
 
-## 7. Out-of-Scope: GPU TEEs and Blackwell
+## 4. Integration: Secret ⇄ AI Plane via Oracles
 
-GPU TEEs (e.g., NVIDIA Blackwell Confidential Computing) are **not used** to run Secret nodes in this architecture.
+### 4.1 On-Chain Oracle Contracts
 
-* The Secret node and TEE execution remain **CPU/VM-based** (SGX, SEV, Nitro).
-* Any use of GPU TEEs is considered a **separate, off-chain system**, such as:
+We use a pattern with two types of contracts:
 
-  * confidential AI oracles,
-  * private analytics engines,
-  * heavy ML/quant workloads feeding data into Secret.
+1. **Oracle Request Contract**
+   - Receives requests from application contracts.  
+   - Stores pending requests and emits events for off-chain relayers.
 
-Such systems would:
+2. **Oracle Consumer (Application) Contract**
+   - Calls the request contract to create a new oracle request.  
+   - Later receives fulfilled responses and updates its state.
 
-* run independently of the node consensus path,
-* integrate with Secret via standard transactions, oracles, or IBC-like mechanisms,
-* be documented in a separate `CONFIDENTIAL_AI_ORACLE.md` or similar.
+### 4.2 Off-Chain Relayer
+
+The relayer:
+
+- Watches events or state changes in the Oracle Request contract.  
+- Translates them into `AIRequest` calls to the AI Plane (Spark).  
+- Converts `AIResponse` back into a transaction to Secret that:
+  - Updates the Request contract.  
+  - Notifies the Consumer contract.
+
+### 4.3 Example Flow: Risk Oracle
+
+Scenario: a Secret DeFi protocol wants a confidential risk score for a portfolio.
+
+1. Application contract calls `OracleRequest::new_request(...)`.  
+2. Request contract logs an event with `request_id` and input data (possibly encrypted).  
+3. Relayer picks up the event and forms an `AIRequest` for model `risk_v1`.  
+4. AI Plane on Spark:
+   - Runs the risk model in GPU TEE.  
+   - Produces `AIResponse` with risk score + model commitment + (optional) TEE attestation.  
+5. Relayer sends `fulfill_request(request_id, AIResponse)` to the Request contract.  
+6. Request contract validates the response and forwards data to the Consumer contract.  
+7. Consumer contract:
+   - Updates its internal state (e.g., collateral requirements, alerts).  
+   - May choose to verify a commitment or signature based on policy.
+
+---
+
+## 5. Example: Liquidity AI + Multi-TEE Node
+
+This example ties both planes together.
+
+- Node Plane: runs the DeFi contract logic and state updates inside SGX or SEV/Nitro.  
+- AI Plane: computes strategy parameters for liquidity management in a confidential way.
+
+High-level steps:
+
+1. A Secret liquidity management contract (running in SGX or SEV/Nitro) needs updated strategy parameters.  
+2. It sends an oracle request describing:
+   - Current positions, volumes, volatility (possibly in encrypted form).  
+3. The AI Plane (Spark) runs a MEMPOOL-/MEV-/DeFi-aware model to suggest:
+   - New ranges, fees, or rebalancing actions.  
+4. The AI output is fed back via oracle into the contract.  
+5. The contract, still running in a CPU TEE, decides what to execute on-chain given:
+   - AI suggestions,  
+   - on-chain constraints,  
+   - safety thresholds.
+
+The key point: the **decision** and **state transition** remain in the CPU TEE node path; the AI Plane provides confidential, high-quality *signals*.
+
+---
+
+## 6. Security & Trust Considerations
+
+### 6.1 CPU TEEs (Node Plane)
+
+- SGX remains the primary, battle-tested TEE for Secret.  
+- SEV/Nitro backends are strictly experimental and must:
+  - Prove determinism.  
+  - Prove attestation correctness.  
+  - Be gated behind configuration / governance in testnets.
+
+### 6.2 GPU TEEs (AI Plane)
+
+- GPU TEEs for AI oracles:
+  - Do not participate in consensus.  
+  - Provide **advisory** outputs to contracts.  
+- Contracts should:
+  - Treat AI results as inputs, not as absolute truth.  
+  - Implement limits, sanity checks, and fallback behaviour.  
+- Attestation from GPU TEEs is beneficial but:
+  - May have different trust properties than SGX/SEV/TDX;  
+  - Should be modelled as *additional assurance*, not a replacement for economic/game-theoretic safeguards.
+
+### 6.3 Oracle & Relayer Risks
+
+- Relayers can be:
+  - Byzantine, offline, or censored.  
+- Mitigations:
+  - Multiple relayers, possibly with different operators.  
+  - On-chain validation of signatures/commitments.  
+  - Timeouts and fallback logic on contracts.
+
+---
+
+## 7. Roadmap Mapping (Architecture Perspective)
+
+- Node Plane:
+  - N0–N5 as described in README (TEE abstraction → SEV/Nitro PoC → testnet registry).  
+- AI Plane:
+  - A0–A5 (API → non-TEE AI → GPU TEE integration → oracles → copilot experiments).
+
+Architecturally, the two tracks are **loosely coupled**:
+
+- Node Plane can evolve independently (even if AI Plane does not exist).  
+- AI Plane can serve other ecosystems too, but here it is designed to integrate tightly with Secret’s privacy guarantees.
 
 ---
 
@@ -303,15 +304,12 @@ Such systems would:
 
 This architecture:
 
-* Introduces a **TEE abstraction layer** (`TEEBackend`) in the Secret node implementation;
-* Allows the existing **SGX enclave** to remain first-class, while enabling experiments with:
+- Keeps Secret’s **core node** conservative and TEE-focused on CPU enclaves (SGX now, SEV/Nitro as R&D).  
+- Exploits NVIDIA Spark’s **GPU TEEs** where they shine: confidential, heavy AI workloads.  
+- Connects both worlds using a clear, auditable oracle pattern, so:
+  - Consensus stays simple and deterministic.  
+  - AI remains powerful, flexible, and privacy-preserving.
 
-  * **AMD SEV-SNP**,
-  * **AWS Nitro Enclaves**,
-    as **Remote VM TEE backends**;
-* Provides a **generic attestation model** that can represent multiple CPU TEEs;
-* Explicitly avoids using GPUs for node execution, aligning with the current Secret design and security expectations.
-
-The goal is to create a **research-friendly, modular** foundation to explore multi-TEE node designs without compromising the stability or assumptions of the existing SGX-based network.
+It is intentionally modular so that individual parts can be replaced, upgraded, or dropped without forcing the entire system to change.
 
 ---
